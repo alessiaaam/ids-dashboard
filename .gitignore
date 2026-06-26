@@ -22,3 +22,4 @@ __pycache__/
 # MacOS
 .DS_Store
 ids_project_code.txt
+*.bak
