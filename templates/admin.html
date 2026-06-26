@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IDS Dashboard — Admin</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="dashboard-page">
+    <nav class="navbar">
+        <div class="nav-brand">IDS Dashboard</div>
+        <div class="nav-links">
+            <a href="{{ url_for('index') }}" class="btn-nav">Dashboard</a>
+            <a href="{{ url_for('alerts') }}" class="btn-nav">Alerte</a>
+            <a href="{{ url_for('report') }}" class="btn-nav">Raport</a>
+            <span class="nav-user">{{ user.username }}</span>
+            <a href="{{ url_for('logout') }}" class="btn-nav">Logout</a>
+        </div>
+    </nav>
+    <main class="main-content">
+        <div class="page-header">
+            <h2>Panou administrare</h2>
+        </div>
+        <div class="section">
+            <h2 style="margin-bottom:16px;">Utilizatori</h2>
+            <table class="admin-table">
+                <thead>
+                    <tr>
+                        <th>Username</th><th>Rol</th><th>2FA</th><th>Actiuni</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for u in all_users %}
+                    <tr>
+                        <td>{{ u.username }}</td>
+                        <td>{{ u.role }}</td>
+                        <td>{% if u.totp_enabled %}<span style="color:var(--accent-green)">activ</span>{% else %}<span style="color:var(--text-muted)">inactiv</span>{% endif %}</td>
+                        <td>
+                            <div style="display:flex; gap:8px;">
+                                {% if u.totp_enabled %}
+                                <form method="POST" action="{{ url_for('admin_toggle_2fa', username=u.username) }}">
+                                    <button type="submit" class="btn-danger">Reseteaza 2FA</button>
+                                </form>
+                                {% endif %}
+                                {% if u.username != 'admin' %}
+                                <form method="POST" action="{{ url_for('admin_delete_user', username=u.username) }}">
+                                    <button type="submit" class="btn-danger">Sterge</button>
+                                </form>
+                                {% endif %}
+                            </div>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        <div class="section">
+            <h2 style="margin-bottom:16px;">Jurnal activitate</h2>
+            {% if activity_log %}
+            <table class="admin-table">
+                <thead>
+                    <tr>
+                        <th>Timestamp</th><th>Utilizator</th><th>Actiune</th><th>Detalii</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for entry in activity_log %}
+                    <tr>
+                        <td>{{ entry.timestamp }}</td>
+                        <td>{{ entry.username }}</td>
+                        <td>{{ entry.action }}</td>
+                        <td>{{ entry.details }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="empty-state">// nicio activitate inregistrata</div>
+            {% endif %}
+        </div>
+    </main>
+</body>
+</html>

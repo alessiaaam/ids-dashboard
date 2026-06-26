@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IDS Dashboard — Alerte</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="dashboard-page">
+    <nav class="navbar">
+        <div class="nav-brand">IDS Dashboard</div>
+        <div class="nav-links">
+            <a href="{{ url_for('index') }}" class="btn-nav">Dashboard</a>
+            <a href="{{ url_for('report') }}" class="btn-nav">Raport</a>
+            <span class="nav-user">{{ user.username }}</span>
+            <a href="{{ url_for('logout') }}" class="btn-nav">Logout</a>
+        </div>
+    </nav>
+    <main class="main-content">
+        <div class="page-header">
+            <h2>Toate alertele</h2>
+            <form method="POST" action="{{ url_for('clear') }}">
+                <button type="submit" class="btn-danger">Sterge toate</button>
+            </form>
+        </div>
+        <div class="section">
+            {% if alerts %}
+            <table class="alerts-table">
+                <thead>
+                    <tr>
+                        <th>ID</th><th>Tip</th><th>Severitate</th><th>IP Sursa</th><th>Detalii</th><th>Timestamp</th><th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for alert in alerts %}
+                    <tr class="alert-row" onclick="togglePanel({{ alert.id }})" style="cursor:pointer;">
+                        <td>{{ alert.id }}</td>
+                        <td>{{ alert.type }}</td>
+                        <td><span class="severity-{{ alert.severity }}">{{ alert.severity }}</span></td>
+                        <td>{{ alert.src_ip or "-" }}</td>
+                        <td>{{ alert.detail }}</td>
+                        <td>{{ alert.timestamp }}</td>
+                        <td style="color:var(--text-muted); font-size:11px;" id="arrow-{{ alert.id }}">▼</td>
+                    </tr>
+                    <tr id="panel-{{ alert.id }}" style="display:none; background:#f8fafc;">
+                        <td colspan="7" style="padding:16px 20px;">
+                            {% if alert.type == "SYN_FLOOD" %}
+                            <div class="panel-desc">Atacatorul a trimis un volum mare de pachete SYN fara a completa handshake-ul TCP, epuizand resursele serverului tinta.</div>
+                            {% elif alert.type == "PORT_SCAN" %}
+                            <div class="panel-desc">Atacatorul a scanat sistematic porturile pentru a identifica servicii active si potentiale vulnerabilitati.</div>
+                            {% elif alert.type == "BRUTE_FORCE" %}
+                            <div class="panel-desc">Atacatorul a incercat in mod repetat combinatii de credentiale pentru a obtine acces neautorizat.</div>
+                            {% endif %}
+                            <div class="alert-panel-grid">
+                                <div class="panel-section">
+                                    <div class="panel-label">Tip atac</div>
+                                    <div class="panel-value">{{ alert.type }}</div>
+                                </div>
+                                <div class="panel-section">
+                                    <div class="panel-label">Severitate</div>
+                                    <div class="panel-value"><span class="severity-{{ alert.severity }}">{{ alert.severity }}</span></div>
+                                </div>
+                                <div class="panel-section">
+                                    <div class="panel-label">IP Sursa</div>
+                                    <div class="panel-value mono">{{ alert.src_ip or "-" }}</div>
+                                </div>
+                                <div class="panel-section">
+                                    <div class="panel-label">Timestamp</div>
+                                    <div class="panel-value mono">{{ alert.timestamp }}</div>
+                                </div>
+                                <div class="panel-section">
+                                    <div class="panel-label">Confidenta model</div>
+                                    <div class="panel-value mono">{{ alert.detail }}</div>
+                                </div>
+                                <div class="panel-section">
+                                    <div class="panel-label">Window ID</div>
+                                    <div class="panel-value mono">{{ alert.window_id if alert.window_id is not none else "-" }}</div>
+                                </div>
+                            </div>
+                            {% if alert.features_json %}
+                            <div class="panel-label" style="margin:14px 0 8px;">Features detectate</div>
+                            <div class="features-grid" id="features-{{ alert.id }}"></div>
+                            {% endif %}
+                            <div class="panel-recommendation">
+                                <div class="panel-label" style="margin-bottom:6px;">Recomandare</div>
+                                {% if alert.type == "SYN_FLOOD" %}
+                                Blocati IP-ul sursa in firewall. Verificati disponibilitatea serviciilor si activati SYN cookies pe serverele afectate.
+                                {% elif alert.type == "PORT_SCAN" %}
+                                Monitorizati IP-ul sursa. Restrictionati accesul la porturile descoperite si revizuiti regulile firewall.
+                                {% elif alert.type == "BRUTE_FORCE" %}
+                                Blocati IP-ul sursa imediat. Verificati jurnalele de autentificare si activati autentificarea in doi factori.
+                                {% else %}
+                                Investigati activitatea IP-ului sursa si revizuiti jurnalele de sistem.
+                                {% endif %}
+                            </div>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="empty-state">// nicio alerta inregistrata</div>
+            {% endif %}
+        </div>
+        {% if session_summary %}
+        <div class="section">
+            <h2 style="margin-bottom:12px;">Analiza AI sesiune</h2>
+            <div class="alert-explanation" style="font-size:13px; line-height:1.7;">{{ session_summary }}</div>
+        </div>
+        {% endif %}
+    </main>
+    <script>
+        var alertFeatures = {{ alerts | map(attribute='features_json') | list | tojson }};
+        var alertIds = {{ alerts | map(attribute='id') | list | tojson }};
+
+        function togglePanel(id) {
+            const panel = document.getElementById("panel-" + id);
+            const arrow = document.getElementById("arrow-" + id);
+            const isVisible = panel.style.display !== "none";
+            document.querySelectorAll("[id^='panel-']").forEach(p => p.style.display = "none");
+            document.querySelectorAll("[id^='arrow-']").forEach(a => a.textContent = "▼");
+            if (!isVisible) {
+                panel.style.display = "table-row";
+                arrow.textContent = "▲";
+                renderFeatures(id);
+            }
+        }
+
+        function renderFeatures(id) {
+            const idx = alertIds.indexOf(id);
+            if (idx === -1) return;
+            const featJson = alertFeatures[idx];
+            if (!featJson) return;
+            const container = document.getElementById("features-" + id);
+            if (!container) return;
+            try {
+                const features = JSON.parse(featJson);
+                container.innerHTML = Object.entries(features).map(([k, v]) =>
+                    `<div class="feature-card"><div class="panel-label">${k}</div><div class="panel-value mono">${v}</div></div>`
+                ).join("");
+            } catch(e) {}
+        }
+    </script>
+</body>
+</html>

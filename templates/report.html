@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IDS Dashboard — Raport</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="dashboard-page">
+    <nav class="navbar">
+        <div class="nav-brand">IDS Dashboard</div>
+        <div class="nav-links">
+            <a href="{{ url_for('index') }}" class="btn-nav">Dashboard</a>
+            <a href="{{ url_for('alerts') }}" class="btn-nav">Alerte</a>
+            <span class="nav-user">{{ user.username }}</span>
+            <a href="{{ url_for('logout') }}" class="btn-nav">Logout</a>
+        </div>
+    </nav>
+    <main class="main-content">
+        <div class="page-header">
+            <h2>Raport</h2>
+            <a href="{{ url_for('download_report') }}" class="btn-capture" style="min-width:auto; text-decoration:none;">Descarca PDF</a>
+        </div>
+        <div class="section">
+            <p class="report-meta">Generat la: {{ report.generated_at }} &nbsp;|&nbsp; Total alerte: {{ report.total_alerts }}</p>
+            {% if report.alerts_by_type %}
+            <div class="stats-grid" style="margin-bottom:20px;">
+                {% for type, count in report.alerts_by_type.items() %}
+                <div class="stat-card">
+                    <h3>{{ type }}</h3>
+                    <p class="stat-value red">{{ count }}</p>
+                </div>
+                {% endfor %}
+            </div>
+            {% endif %}
+            {% if report.alerts %}
+            <table class="alerts-table">
+                <thead>
+                    <tr>
+                        <th>ID</th><th>Tip</th><th>Severitate</th><th>Detalii</th><th>Timestamp</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for alert in report.alerts %}
+                    <tr>
+                        <td>{{ alert.id }}</td>
+                        <td>{{ alert.type }}</td>
+                        <td><span class="severity-{{ alert.severity }}">{{ alert.severity }}</span></td>
+                        <td>{{ alert.detail }}</td>
+                        <td>{{ alert.timestamp }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="empty-state">// nicio alerta inregistrata</div>
+            {% endif %}
+        </div>
+    </main>
+</body>
+</html>

@@ -1,0 +1,23 @@
+# Fisiere sensibile
+.env
+users_config.json
+certs/
+
+# Baza de date
+ids_database.db
+
+# Fisiere incarcate
+uploads/
+
+# Modelul antrenat si dataseturile (prea mari)
+ml/random_forest.pkl
+ml/*.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# MacOS
+.DS_Store

@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IDS Dashboard — Verificare 2FA</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="auth-page">
+    <div class="auth-container">
+        <div class="auth-box">
+            <h1>Verificare 2fa</h1>
+            {% with messages = get_flashed_messages() %}
+                {% if messages %}
+                    <div class="alert alert-error">{{ messages[0] }}</div>
+                {% endif %}
+            {% endwith %}
+            <p class="auth-subtitle">Introdu codul din aplicatia Google Authenticator.</p>
+            <form method="POST">
+                <div class="form-group">
+                    <label>Cod 2FA</label>
+                    <input type="text" name="token" maxlength="6" required autofocus placeholder="000000" autocomplete="one-time-code">
+                </div>
+                <button type="submit" class="btn-primary">Verifica</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>

@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IDS Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="dashboard-page">
+    <nav class="navbar">
+        <div class="nav-brand">IDS Dashboard</div>
+        <div class="nav-links">
+            {% if user.is_admin() %}
+            <a href="{{ url_for('admin_panel') }}" class="btn-nav">Admin</a>
+            {% endif %}
+            <a href="{{ url_for('alerts') }}" class="btn-nav">Alerte</a>
+            <a href="{{ url_for('report') }}" class="btn-nav">Raport</a>
+            <a href="{{ url_for('setup_2fa') }}" class="btn-nav">2FA</a>
+            <span class="nav-user">{{ user.username }}</span>
+            <a href="{{ url_for('logout') }}" class="btn-nav">Logout</a>
+        </div>
+    </nav>
+    <main class="main-content">
+        <div class="page-header">
+            <h2>Sumar</h2>
+            <span class="status-badge {% if total_alerts == 0 %}status-ok{% else %}status-alert{% endif %}">
+                {% if total_alerts == 0 %}sistem securizat{% else %}{{ total_alerts }} alerte active{% endif %}
+            </span>
+        </div>
+        <div class="stats-grid">
+            <div class="stat-card">
+                <h3>Status sistem</h3>
+                <p class="stat-value green">Activ</p>
+            </div>
+            <div class="stat-card">
+                <h3>Alerte totale</h3>
+                <p class="stat-value">{{ total_alerts }}</p>
+            </div>
+            {% for type, count in alerts_by_type.items() %}
+            <div class="stat-card">
+                <h3>{{ type }}</h3>
+                <p class="stat-value red">{{ count }}</p>
+            </div>
+            {% endfor %}
+        </div>
+        <div class="section">
+            <h2 style="font-size:13px; font-weight:600; margin-bottom:14px; color:var(--text-secondary); text-transform:uppercase; letter-spacing:0.06em;">Captare live</h2>
+            <div class="capture-bar">
+                <div class="capture-status">
+                    <span class="capture-dot" id="capture-dot"></span>
+                    <span id="capture-label">Captare oprita</span>
+                </div>
+                <div class="capture-actions">
+                    <button class="btn-capture" onclick="startCapture()">Porneste captare</button>
+                    <button class="btn-capture btn-capture-stop" onclick="stopCapture()">Opreste captare</button>
+                </div>
+            </div>
+        </div>
+        <div class="section">
+            <h2 style="font-size:13px; font-weight:600; margin-bottom:14px; color:var(--text-secondary); text-transform:uppercase; letter-spacing:0.06em;">Upload fisier PCAP</h2>
+            <form method="POST" action="{{ url_for('upload_pcap') }}" enctype="multipart/form-data" class="upload-form">
+                <div class="form-group">
+                    <label>Selecteaza fisier .pcap</label>
+                    <input type="file" name="pcap_file" accept=".pcap,.pcapng" required>
+                </div>
+                <button type="submit" class="btn-capture">Analizeaza</button>
+            </form>
+        </div>
+        {% if total_alerts == 0 %}
+        <div class="ok-banner">
+            <div class="ok-icon">&#10003;</div>
+            <div>
+                <strong>Nicio amenintare detectata</strong>
+                <p>Sistemul monitorizeaza traficul de retea. Nu au fost detectate comportamente suspecte.</p>
+            </div>
+        </div>
+        {% else %}
+        {% if session_summary %}
+        <div class="session-summary">
+            <div class="session-summary-label">Analiza AI sesiune</div>
+            {{ session_summary }}
+        </div>
+        {% endif %}
+        <div class="section">
+            <div class="section-header">
+                <h2>Alerte recente</h2>
+                <a href="{{ url_for('alerts') }}" class="btn-link" style="margin-top:0;">Vezi toate</a>
+            </div>
+            <table class="alerts-table" style="margin-bottom:24px;">
+                <thead>
+                    <tr>
+                        <th>ID</th><th>Tip</th><th>Severitate</th><th>IP Sursa</th><th>Detalii</th><th>Timestamp</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for alert in alerts %}
+                    <tr>
+                        <td>{{ alert.id }}</td>
+                        <td>{{ alert.type }}</td>
+                        <td><span class="severity-{{ alert.severity }}">{{ alert.severity }}</span></td>
+                        <td>{{ alert.src_ip or "-" }}</td>
+                        <td>{{ alert.detail }}</td>
+                        <td>{{ alert.timestamp }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+
+        </div>
+        {% endif %}
+    </main>
+    <script>
+        function checkStatus() {
+            fetch("/capture/status").then(r => r.json()).then(data => {
+                const dot = document.getElementById("capture-dot");
+                const label = document.getElementById("capture-label");
+                if (data.running) {
+                    dot.classList.add("dot-active");
+                    label.textContent = "Captare activa";
+                } else {
+                    dot.classList.remove("dot-active");
+                    label.textContent = "Captare oprita";
+                }
+            });
+        }
+        function startCapture() { fetch("/capture/start", {method:"POST"}).then(() => checkStatus()); }
+        function stopCapture() { fetch("/capture/stop", {method:"POST"}).then(() => { checkStatus(); setTimeout(() => location.reload(), 12000); }); }
+        checkStatus();
+        setInterval(checkStatus, 5000);
+        setInterval(() => location.reload(), 30000);
+    </script>
+</body>
+</html>

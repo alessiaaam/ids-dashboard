@@ -1,0 +1,1250 @@
+=== ./alerts/alert_manager.py ===
+from database import insert_alert, get_all_alerts, get_alerts_count, get_alerts_by_type, clear_all_alerts
+
+def add_alerts(alerts):
+    for alert in alerts:
+        insert_alert(alert)
+
+def get_all_alerts_list(limit=100):
+    return get_all_alerts(limit)
+
+def get_count():
+    return get_alerts_count()
+
+def get_by_type():
+    return get_alerts_by_type()
+
+def clear_alerts():
+    clear_all_alerts()
+
+=== ./app.py ===
+from ml.random_forest_model import predict_rf
+from notifications.email_sender import send_critical_alerts
+from flask import Flask, render_template, redirect, url_for, request, flash, session, jsonify
+from flask_login import LoginManager, login_user, logout_user, login_required, current_user
+from dotenv import load_dotenv
+from auth.login import get_user, get_user_by_id, get_all_users, users, save_users, register_user
+from auth.rate_limiter import record_attempt, is_blocked
+from database import log_activity, get_activity_log, get_session_summary, save_session_summary
+from auth.totp import generate_totp_secret, generate_qr_code, verify_totp
+from capture.pcap_reader import read_pcap
+from capture.live_capture import LiveCapture
+from preprocessing.packet_parser import parse_packets
+from features.feature_extractor import extract_features
+from alerts.alert_manager import add_alerts, get_all_alerts_list as get_all_alerts, get_count as get_alerts_count, get_by_type as get_alerts_by_type, clear_alerts
+from reports.report_generator import generate_report, generate_pdf_report
+from ml.gemini_explainer import explain_alerts_batch, analyze_session
+import os
+import threading
+from datetime import datetime, timedelta
+
+load_dotenv()
+
+app = Flask(__name__)
+app.secret_key = os.getenv("SECRET_KEY", "dev-secret-key")
+app.config["SESSION_PERMANENT"] = False
+app.config["SESSION_COOKIE_SECURE"] = True
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_TIMEOUT_MINUTES"] = 8
+
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = "login"
+
+@app.before_request
+def check_session_timeout():
+    if current_user.is_authenticated:
+        if not current_user.totp_enabled and request.endpoint not in ("setup_2fa", "logout", "static"):
+            return redirect(url_for("setup_2fa"))
+        last_active = session.get("last_active")
+        if last_active:
+            last_active = datetime.fromisoformat(last_active)
+            timeout = timedelta(minutes=app.config["SESSION_TIMEOUT_MINUTES"])
+            if datetime.utcnow() - last_active > timeout:
+                logout_user()
+                session.clear()
+                return redirect(url_for("login"))
+        session["last_active"] = datetime.utcnow().isoformat()
+
+capture_instance = None
+capture_lock = threading.Lock()
+
+@app.route("/capture/start", methods=["POST"])
+@login_required
+def start_capture():
+    global capture_instance
+    with capture_lock:
+        if capture_instance and capture_instance.running:
+            return jsonify({"status": "already_running"})
+        interface = os.getenv("CAPTURE_INTERFACE", "bridge100")
+        capture_instance = LiveCapture(interface, process_live_packet)
+        capture_instance.start()
+    return jsonify({"status": "started"})
+
+@app.route("/capture/stop", methods=["POST"])
+@login_required
+def stop_capture():
+    global capture_instance
+    with capture_lock:
+        if capture_instance:
+            capture_instance.stop()
+    return jsonify({"status": "stopped"})
+
+@app.route("/capture/status")
+@login_required
+def capture_status():
+    global capture_instance
+    running = capture_instance is not None and capture_instance.running
+    return jsonify({"running": running})
+
+live_buffer = []
+live_buffer_lock = threading.Lock()
+
+def process_live_packet(pkt):
+    with live_buffer_lock:
+        live_buffer.append(pkt)
+
+def analyze_live_buffer():
+    from preprocessing.packet_parser import parse_packets
+    from features.feature_extractor import extract_features
+    from ml.gemini_explainer import explain_alerts_batch, analyze_session
+    import time
+
+    while True:
+        time.sleep(15)
+        with live_buffer_lock:
+            if not live_buffer:
+                continue
+            packets = list(live_buffer)
+            live_buffer.clear()
+
+        try:
+            parsed = parse_packets(packets)
+            features = extract_features(parsed, window_size=10)
+            if features.empty:
+                continue
+            all_alerts = predict_rf(features)
+            seen_types = {}
+            for alert in all_alerts:
+                t = alert["type"]
+                if t not in seen_types:
+                    seen_types[t] = alert
+            final_alerts = list(seen_types.values())
+            if final_alerts:
+                final_alerts = explain_alerts_batch(final_alerts)
+                add_alerts(final_alerts)
+                summary = ""
+                try:
+                    summary = analyze_session(final_alerts)
+                    save_session_summary(summary)
+                except:
+                    pass
+                send_critical_alerts(final_alerts, summary)
+        except Exception as e:
+            print(f"Eroare analiza live: {e}")
+
+analyzer_thread = threading.Thread(target=analyze_live_buffer, daemon=True)
+analyzer_thread.start()
+
+@login_manager.user_loader
+def load_user(user_id):
+    return get_user_by_id(user_id)
+
+@app.route("/")
+@login_required
+def index():
+    alerts = get_all_alerts()
+    session_summary = get_session_summary()
+    resp = render_template(
+        "dashboard.html",
+        user=current_user,
+        alerts=alerts[:10],
+        total_alerts=get_alerts_count(),
+        alerts_by_type=get_alerts_by_type(),
+        session_summary=session_summary,
+    )
+    from flask import make_response
+    response = make_response(resp)
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        ip = request.remote_addr
+        if is_blocked(ip):
+            flash("Prea multe incercari. Asteptati 15 minute.")
+            return render_template("login.html")
+        username = request.form.get("username")
+        password = request.form.get("password")
+        user = get_user(username)
+        if not user or not user.check_password(password):
+            record_attempt(ip)
+            flash("Username sau parola incorecte.")
+            return render_template("login.html")
+        if user.totp_enabled:
+            session["pre_2fa_user"] = username
+            return redirect(url_for("verify_2fa"))
+        login_user(user)
+        log_activity(user.username, "LOGIN", "Autentificare reusita")
+        if not user.totp_enabled:
+            return redirect(url_for("setup_2fa"))
+        return redirect(url_for("index"))
+    return render_template("login.html")
+
+@app.route("/verify-2fa", methods=["GET", "POST"])
+def verify_2fa():
+    username = session.get("pre_2fa_user")
+    if not username:
+        return redirect(url_for("login"))
+    if request.method == "POST":
+        token = request.form.get("token")
+        user = get_user(username)
+        if verify_totp(user.totp_secret, token):
+            session.pop("pre_2fa_user", None)
+            login_user(user)
+            return redirect(url_for("index"))
+        flash("Cod 2FA incorect.")
+    return render_template("verify_2fa.html")
+
+@app.route("/setup-2fa", methods=["GET", "POST"])
+@login_required
+def setup_2fa():
+    user = current_user
+    if request.method == "POST":
+        token = request.form.get("token")
+        secret = session.get("totp_secret_temp")
+        if verify_totp(secret, token):
+            users[user.username].totp_secret = secret
+            users[user.username].totp_enabled = True
+            save_users()
+            session.pop("totp_secret_temp", None)
+            flash("2FA activat cu succes.")
+            return redirect(url_for("index"))
+        flash("Cod incorect. Incearca din nou.")
+    secret = generate_totp_secret()
+    session["totp_secret_temp"] = secret
+    qr = generate_qr_code(secret, user.username)
+    return render_template("setup_2fa.html", qr=qr, secret=secret)
+
+@app.route("/logout")
+@login_required
+def logout():
+    log_activity(current_user.username, "LOGOUT", "Deconectare")
+    logout_user()
+    return redirect(url_for("login"))
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "POST":
+        username = request.form.get("username")
+        password = request.form.get("password")
+        success, message = register_user(username, password)
+        if success:
+            log_activity(username, "REGISTER", "Cont nou creat")
+            return redirect(url_for("login"))
+        flash(message)
+    return render_template("register.html")
+
+@app.route("/admin")
+@login_required
+def admin_panel():
+    if not current_user.is_admin():
+        return redirect(url_for("index"))
+    return render_template("admin.html",
+        user=current_user,
+        all_users=get_all_users(),
+        activity_log=get_activity_log()
+    )
+
+@app.route("/admin/toggle-2fa/<username>", methods=["POST"])
+@login_required
+def admin_toggle_2fa(username):
+    if not current_user.is_admin():
+        return redirect(url_for("index"))
+    target = get_user(username)
+    if target:
+        users[username].totp_enabled = False
+        users[username].totp_secret = None
+        save_users()
+        log_activity(current_user.username, "ADMIN_RESET_2FA", f"2FA resetat pentru {username}")
+    return redirect(url_for("admin_panel"))
+
+@app.route("/admin/delete/<username>", methods=["POST"])
+@login_required
+def admin_delete_user(username):
+    if not current_user.is_admin():
+        return redirect(url_for("index"))
+    if username == "admin":
+        return redirect(url_for("admin_panel"))
+    if username in users:
+        del users[username]
+        save_users()
+        log_activity(current_user.username, "ADMIN_DELETE_USER", f"Utilizator sters: {username}")
+    return redirect(url_for("admin_panel"))
+
+@app.route("/upload-pcap", methods=["GET", "POST"])
+@login_required
+def upload_pcap():
+    if request.method == "POST":
+        file = request.files.get("pcap_file")
+        if not file:
+            return redirect(url_for("index"))
+        import uuid
+        path = f"uploads/{uuid.uuid4().hex}_{file.filename}"
+        file.save(path)
+        try:
+            clear_alerts()
+            raw = read_pcap(path)
+            parsed = parse_packets(raw)
+            features = extract_features(parsed)
+            if not features.empty:
+                all_alerts = predict_rf(features)
+                seen_types = {}
+                for alert in all_alerts:
+                    t = alert["type"]
+                    if t not in seen_types:
+                        seen_types[t] = alert
+                final_alerts = list(seen_types.values())
+                final_alerts = explain_alerts_batch(final_alerts)
+                add_alerts(final_alerts)
+                summary = ""
+                try:
+                    summary = analyze_session(final_alerts)
+                    save_session_summary(summary)
+                except:
+                    pass
+                send_critical_alerts(final_alerts, summary)
+                log_activity(current_user.username, "PCAP_UPLOAD", f"Analizat {file.filename}, {len(final_alerts)} alerte")
+        except Exception as e:
+            print(f"Eroare upload: {e}")
+        return redirect(url_for("index"))
+    return redirect(url_for("index"))
+
+@app.route("/alerts")
+@login_required
+def alerts():
+    return render_template("alerts.html", alerts=get_all_alerts(), user=current_user, session_summary=get_session_summary())
+
+@app.route("/alerts/clear", methods=["POST"])
+@login_required
+def clear():
+    clear_alerts()
+    save_session_summary("")
+    return redirect(url_for("alerts"))
+
+@app.route("/report")
+@login_required
+def report():
+    return render_template("report.html", report=generate_report(), user=current_user)
+
+@app.route("/report/download")
+@login_required
+def download_report():
+    from flask import send_file
+    buffer = generate_pdf_report()
+    return send_file(buffer, mimetype="application/pdf",
+        as_attachment=True, download_name="ids_report.pdf")
+
+@app.route("/api/status")
+@login_required
+def api_status():
+    return jsonify({
+        "status": "running",
+        "user": current_user.username,
+        "total_alerts": get_alerts_count(),
+        "alerts_by_type": get_alerts_by_type(),
+    })
+
+if __name__ == "__main__":
+    ssl_ctx = ("certs/cert.pem", "certs/key.pem") if os.path.exists("certs/cert.pem") else None
+    app.run(host="0.0.0.0", port=5000, debug=False, ssl_context=ssl_ctx)
+
+=== ./auth/login.py ===
+from flask_login import UserMixin
+from werkzeug.security import generate_password_hash, check_password_hash
+import os
+import json
+
+USERS_FILE = "users_config.json"
+
+class User(UserMixin):
+    def __init__(self, id, username, password_hash, role="user", totp_secret=None, totp_enabled=False):
+        self.id = id
+        self.username = username
+        self.password_hash = password_hash
+        self.role = role
+        self.totp_secret = totp_secret
+        self.totp_enabled = totp_enabled
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+    def is_admin(self):
+        return self.role == "admin"
+
+def _load_users():
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, "r") as f:
+            data = json.load(f)
+        loaded = {}
+        for username, info in data.items():
+            loaded[username] = User(
+                id=username,
+                username=username,
+                password_hash=info["password_hash"],
+                role=info.get("role", "user"),
+                totp_secret=info.get("totp_secret"),
+                totp_enabled=info.get("totp_enabled", False)
+            )
+        return loaded
+    else:
+        default = {
+            "admin": {
+                "password_hash": generate_password_hash(os.getenv("ADMIN_PASSWORD", "admin")),
+                "role": "admin",
+                "totp_secret": None,
+                "totp_enabled": False
+            }
+        }
+        with open(USERS_FILE, "w") as f:
+            json.dump(default, f, indent=2)
+        return {
+            "admin": User(
+                id="admin",
+                username="admin",
+                password_hash=default["admin"]["password_hash"],
+                role="admin",
+                totp_secret=None,
+                totp_enabled=False
+            )
+        }
+
+def _save_users(users_dict):
+    data = {}
+    for username, user in users_dict.items():
+        data[username] = {
+            "password_hash": user.password_hash,
+            "role": user.role,
+            "totp_secret": user.totp_secret,
+            "totp_enabled": user.totp_enabled
+        }
+    with open(USERS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+users = _load_users()
+
+def get_user(username):
+    return users.get(username)
+
+def get_user_by_id(user_id):
+    return users.get(user_id)
+
+def get_all_users():
+    return list(users.values())
+
+def register_user(username, password):
+    if username in users:
+        return False, "Utilizatorul exista deja."
+    if len(username) < 3:
+        return False, "Username-ul trebuie sa aiba minim 3 caractere."
+    if len(password) < 6:
+        return False, "Parola trebuie sa aiba minim 6 caractere."
+    users[username] = User(
+        id=username,
+        username=username,
+        password_hash=generate_password_hash(password),
+        role="user"
+    )
+    save_users()
+    return True, "Cont creat cu succes."
+
+def save_users():
+    _save_users(users)
+
+=== ./auth/rate_limiter.py ===
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+login_attempts = defaultdict(list)
+blocked_ips = {}
+
+MAX_ATTEMPTS = 5
+BLOCK_DURATION_MINUTES = 15
+
+def record_attempt(ip):
+    now = datetime.utcnow()
+    login_attempts[ip] = [t for t in login_attempts[ip] if now - t < timedelta(minutes=10)]
+    login_attempts[ip].append(now)
+    if len(login_attempts[ip]) >= MAX_ATTEMPTS:
+        blocked_ips[ip] = now + timedelta(minutes=BLOCK_DURATION_MINUTES)
+        return False
+    return True
+
+def is_blocked(ip):
+    if ip in blocked_ips:
+        if datetime.utcnow() < blocked_ips[ip]:
+            return True
+        else:
+            del blocked_ips[ip]
+    return False
+
+=== ./auth/totp.py ===
+import pyotp
+import qrcode
+import io
+import base64
+
+def generate_totp_secret():
+    return pyotp.random_base32()
+
+def get_totp_uri(secret, username):
+    return pyotp.totp.TOTP(secret).provisioning_uri(
+        name=username,
+        issuer_name="IDS Dashboard"
+    )
+
+def generate_qr_code(secret, username):
+    uri = get_totp_uri(secret, username)
+    img = qrcode.make(uri)
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode()
+    return f"data:image/png;base64,{encoded}"
+
+def verify_totp(secret, token):
+    totp = pyotp.TOTP(secret)
+    return totp.verify(token)
+
+=== ./capture/live_capture.py ===
+from scapy.all import sniff, IP, TCP, UDP
+import threading
+
+class LiveCapture:
+    def __init__(self, interface, packet_callback):
+        self.interface = interface
+        self.packet_callback = packet_callback
+        self.running = False
+        self._thread = None
+
+    def start(self):
+        self.running = True
+        self._thread = threading.Thread(target=self._capture, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self.running = False
+
+    def _capture(self):
+        sniff(
+            iface=self.interface,
+            prn=self._process_packet,
+            store=False,
+            stop_filter=lambda _: not self.running
+        )
+
+    def _process_packet(self, pkt):
+        if not pkt.haslayer(IP):
+            return
+
+        ip = pkt[IP]
+        result = {
+            "timestamp": float(pkt.time),
+            "src_ip": ip.src,
+            "dst_ip": ip.dst,
+            "protocol": ip.proto,
+            "length": len(pkt),
+            "src_port": None,
+            "dst_port": None,
+            "tcp_flags": None,
+        }
+
+        if pkt.haslayer(TCP):
+            result["src_port"] = pkt[TCP].sport
+            result["dst_port"] = pkt[TCP].dport
+            result["tcp_flags"] = pkt[TCP].flags
+        elif pkt.haslayer(UDP):
+            result["src_port"] = pkt[UDP].sport
+            result["dst_port"] = pkt[UDP].dport
+
+        self.packet_callback(result)
+
+=== ./capture/pcap_reader.py ===
+from scapy.all import rdpcap, IP, TCP, UDP
+import os
+
+def read_pcap(filepath):
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"Fisierul {filepath} nu exista.")
+    
+    packets = rdpcap(filepath)
+    parsed = []
+    
+    for pkt in packets:
+        parsed.append(parse_packet(pkt))
+    
+    return [p for p in parsed if p is not None]
+
+def parse_packet(pkt):
+    if not pkt.haslayer(IP):
+        return None
+    
+    ip = pkt[IP]
+    result = {
+        "timestamp": float(pkt.time),
+        "src_ip": ip.src,
+        "dst_ip": ip.dst,
+        "protocol": ip.proto,
+        "length": len(pkt),
+        "src_port": None,
+        "dst_port": None,
+        "tcp_flags": None,
+    }
+    
+    if pkt.haslayer(TCP):
+        result["src_port"] = pkt[TCP].sport
+        result["dst_port"] = pkt[TCP].dport
+        result["tcp_flags"] = pkt[TCP].flags
+    elif pkt.haslayer(UDP):
+        result["src_port"] = pkt[UDP].sport
+        result["dst_port"] = pkt[UDP].dport
+    
+    return result
+
+=== ./database.py ===
+import sqlite3
+from datetime import datetime
+
+DB_PATH = "ids_database.db"
+
+def get_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            detail TEXT,
+            src_ip TEXT,
+            features_json TEXT,
+            anomaly_score REAL,
+            explanation TEXT,
+            correlated INTEGER DEFAULT 0,
+            window_id INTEGER,
+            timestamp TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            action TEXT NOT NULL,
+            details TEXT,
+            timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS session_summary (
+            id INTEGER PRIMARY KEY,
+            summary TEXT,
+            updated_at TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def get_session_summary():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT summary FROM session_summary WHERE id=1")
+    row = cursor.fetchone()
+    conn.close()
+    return row["summary"] if row else ""
+
+def save_session_summary(summary):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT OR REPLACE INTO session_summary (id, summary, updated_at)
+        VALUES (1, ?, datetime('now'))
+    """, (summary,))
+    conn.commit()
+    conn.close()
+
+def alert_exists_recently(alert_type, seconds=120):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT COUNT(*) as cnt FROM alerts
+        WHERE type=? AND created_at >= datetime('now', ?)
+    """, (alert_type, f'-{seconds} seconds'))
+    row = cursor.fetchone()
+    conn.close()
+    return row["cnt"] > 0
+
+def insert_alert(alert):
+    if alert_exists_recently(alert.get("type", ""), seconds=120):
+        return
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO alerts (type, severity, detail, src_ip, features_json, anomaly_score, explanation, correlated, window_id, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        alert.get("type"),
+        alert.get("severity"),
+        alert.get("detail"),
+        alert.get("src_ip"),
+        alert.get("features_json"),
+        alert.get("anomaly_score"),
+        alert.get("explanation"),
+        1 if alert.get("correlated") else 0,
+        int(alert.get("window_id")) if alert.get("window_id") is not None else None,
+        str(datetime.utcfromtimestamp(float(alert["timestamp"])).strftime("%Y-%m-%d %H:%M:%S")) if alert.get("timestamp") else datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    ))
+    conn.commit()
+    conn.close()
+
+def get_all_alerts(limit=100):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM alerts ORDER BY created_at DESC LIMIT ?", (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+def get_alerts_count():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM alerts")
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count
+
+def get_alerts_by_type():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT type, COUNT(*) as count FROM alerts GROUP BY type")
+    rows = cursor.fetchall()
+    conn.close()
+    return {row["type"]: row["count"] for row in rows}
+
+def clear_all_alerts():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM alerts")
+    conn.commit()
+    conn.close()
+
+def log_activity(username, action, details=""):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO activity_log (username, action, details)
+        VALUES (?, ?, ?)
+    """, (username, action, details))
+    conn.commit()
+    conn.close()
+
+def get_activity_log(limit=100):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM activity_log ORDER BY timestamp DESC LIMIT ?", (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+init_db()
+
+=== ./features/feature_extractor.py ===
+import pandas as pd
+
+def extract_features(packets, window_size=10):
+    if not packets:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(packets)
+    df["timestamp"] = pd.to_numeric(df["timestamp"])
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    t_min = df["timestamp"].min()
+    df["window"] = ((df["timestamp"] - t_min) // window_size).astype(int)
+
+    windows = []
+
+    for window_id, group in df.groupby("window"):
+        duration = group["timestamp"].max() - group["timestamp"].min()
+        if duration == 0:
+            duration = 1
+
+        syn_count = group["SYN"].sum() if "SYN" in group.columns else 0
+        ack_count = group["ACK"].sum() if "ACK" in group.columns else 0
+
+        syn_ack_ratio = syn_count / ack_count if ack_count > 0 else float(syn_count)
+
+        repeated = group.groupby(["src_ip", "dst_ip", "dst_port"]).size()
+        repeated_connections = int((repeated > 1).sum())
+
+        top_src_ip = group["src_ip"].value_counts().idxmax() if len(group) > 0 else "unknown"
+
+        features = {
+            "window_id": window_id,
+            "window_start": group["timestamp"].min(),
+            "window_end": group["timestamp"].max(),
+            "total_packets": len(group),
+            "total_bytes": group["length"].sum(),
+            "packets_per_second": len(group) / duration,
+            "bytes_per_second": group["length"].sum() / duration,
+            "unique_source_ips": group["src_ip"].nunique(),
+            "unique_destination_ips": group["dst_ip"].nunique(),
+            "unique_destination_ports": group["dst_port"].dropna().nunique(),
+            "syn_count": int(syn_count),
+            "ack_count": int(ack_count),
+            "syn_ack_ratio": round(syn_ack_ratio, 4),
+            "repeated_connections_to_same_port": repeated_connections,
+            "src_ip": top_src_ip,
+        }
+
+        windows.append(features)
+
+    return pd.DataFrame(windows)
+
+=== ./ml/gemini_explainer.py ===
+from google import genai
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+def analyze_session(alerts):
+    if not alerts:
+        return ""
+
+    attack_summary = []
+    for a in alerts:
+        attack_summary.append(f"- {a.get('type')}: {a.get('detail')}")
+    attacks_text = "\n".join(attack_summary)
+
+    prompt = f"""Esti un expert in securitate cibernetica. Analizeaza urmatoarele alerte detectate de un sistem IDS si scrie o analiza clara in limba romana corecta.
+
+Alerte detectate:
+{attacks_text}
+
+Scrie un paragraf de 4-5 propozitii care explica:
+1. Ce s-a intamplat in aceasta sesiune
+2. Daca atacurile sunt corelate si ce sugereaza impreuna
+3. Nivelul de pericol general
+4. O recomandare concreta de actiune
+
+Romana corecta, fara formatare, fara cuvinte in engleza, fara liste."""
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+        return response.text.strip()
+    except Exception as e:
+        return ""
+
+def explain_alerts_batch(alerts):
+    type_explanations = {}
+    for alert in alerts:
+        attack_type = alert.get("type")
+        if attack_type not in type_explanations:
+            type_explanations[attack_type] = ""
+    for alert in alerts:
+        alert["explanation"] = type_explanations.get(alert.get("type"), "")
+    return alerts
+
+=== ./ml/random_forest_model.py ===
+import pandas as pd
+import json
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, accuracy_score
+import joblib
+import os
+
+MODEL_PATH = "ml/random_forest.pkl"
+
+FEATURES_USED = [
+    "total_packets",
+    "total_bytes",
+    "packets_per_second",
+    "bytes_per_second",
+    "unique_destination_ports",
+    "syn_count",
+    "syn_ack_ratio",
+]
+
+LABEL_MAP = {
+    "BENIGN": 0,
+    "PORT_SCAN": 1,
+    "SYN_FLOOD": 2,
+    "BRUTE_FORCE": 3,
+}
+
+LABEL_NAMES = {v: k for k, v in LABEL_MAP.items()}
+
+def map_cicids_to_features(df):
+    result = pd.DataFrame()
+    result["total_packets"] = df["Total Fwd Packets"] + df["Total Backward Packets"]
+    result["total_bytes"] = df["Total Length of Fwd Packets"] + df["Total Length of Bwd Packets"]
+    result["packets_per_second"] = df["Flow Packets/s"].replace([np.inf, -np.inf], 0)
+    result["bytes_per_second"] = df["Flow Bytes/s"].replace([np.inf, -np.inf], 0)
+    result["unique_destination_ports"] = df["Destination Port"]
+    result["syn_count"] = df["SYN Flag Count"]
+    ack = df["ACK Flag Count"].replace(0, 1)
+    result["syn_ack_ratio"] = (df["SYN Flag Count"] / ack).replace([np.inf, -np.inf], 0)
+    return result.fillna(0)
+
+def map_label(label):
+    label = str(label).strip()
+    if label == "BENIGN":
+        return 0
+    elif label == "PortScan":
+        return 1
+    elif label in ["DoS slowloris", "DoS Slowhttptest", "DoS Hulk", "DoS GoldenEye", "DDoS"]:
+        return 2
+    elif label in ["Brute Force", "FTP-Patator", "SSH-Patator"]:
+        return 3
+    elif label == "Heartbleed":
+        return 2
+    else:
+        return 0
+
+def load_and_prepare(filepath, sample_benign=5000, sample_attack=5000):
+    print(f"Incarc {filepath}...")
+    df = pd.read_csv(filepath)
+    df.columns = df.columns.str.strip()
+    df["label_num"] = df["Label"].apply(map_label)
+    benign = df[df["label_num"] == 0].sample(min(sample_benign, len(df[df["label_num"] == 0])), random_state=42)
+    attack = df[df["label_num"] != 0].sample(min(sample_attack, len(df[df["label_num"] != 0])), random_state=42)
+    sampled = pd.concat([benign, attack])
+    X = map_cicids_to_features(sampled)
+    y = sampled["label_num"]
+    return X, y
+
+def load_lab_data(filepath="ml/lab_data.csv"):
+    df = pd.read_csv(filepath)
+    X = df[FEATURES_USED].fillna(0)
+    y = df["label"]
+    return X, y
+
+def train():
+    dfs_X, dfs_y = [], []
+
+    X1, y1 = load_and_prepare("ml/Wednesday-workingHours.pcap_ISCX.csv")
+    dfs_X.append(X1)
+    dfs_y.append(y1)
+
+    X2, y2 = load_and_prepare("ml/Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv")
+    dfs_X.append(X2)
+    dfs_y.append(y2)
+
+    X3, y3 = load_and_prepare("ml/Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv")
+    dfs_X.append(X3)
+    dfs_y.append(y3)
+
+    print("Incarc ml/lab_data.csv...")
+    X4, y4 = load_lab_data()
+    dfs_X.append(X4)
+    dfs_y.append(y4)
+
+    X = pd.concat(dfs_X).reset_index(drop=True)
+    y = pd.concat(dfs_y).reset_index(drop=True)
+
+    print(f"Total exemple: {len(X)}")
+    print(f"Distributie clase: {y.value_counts().to_dict()}")
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+    print("Antrenez Random Forest...")
+    model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1, oob_score=True)
+    model.fit(X_train, y_train)
+
+    y_pred = model.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+    print(f"Accuracy (test set): {acc:.4f} ({acc*100:.2f}%)")
+    print(f"OOB Score: {model.oob_score_:.4f} ({model.oob_score_*100:.2f}%)")
+    print()
+    labels_present = sorted(y_test.unique())
+    names_present = [["BENIGN", "PORT_SCAN", "SYN_FLOOD", "BRUTE_FORCE"][l] for l in labels_present]
+    print(classification_report(y_test, y_pred, labels=labels_present, target_names=names_present))
+
+    joblib.dump(model, MODEL_PATH)
+    print(f"Model salvat la {MODEL_PATH}")
+    return model
+
+def load_model():
+    if not os.path.exists(MODEL_PATH):
+        return train()
+    return joblib.load(MODEL_PATH)
+
+def predict_rf(features_df):
+    if features_df.empty:
+        return []
+
+    model = load_model()
+    X = features_df[FEATURES_USED].fillna(0)
+    predictions = model.predict(X)
+    probabilities = model.predict_proba(X)
+
+    alerts = []
+    for i, (pred, proba) in enumerate(zip(predictions, probabilities)):
+        if pred == 0:
+            continue
+        row = features_df.iloc[i]
+        confidence = round(float(max(proba)) * 100, 1)
+        label = LABEL_NAMES.get(int(pred), "UNKNOWN")
+        severity_map = {
+            "PORT_SCAN": "HIGH",
+            "SYN_FLOOD": "CRITICAL",
+            "BRUTE_FORCE": "CRITICAL",
+        }
+        severity = severity_map.get(label, "MEDIUM")
+        features_dict = {
+            "total_packets": int(row.get("total_packets", 0)),
+            "total_bytes": int(row.get("total_bytes", 0)),
+            "packets_per_second": round(float(row.get("packets_per_second", 0)), 2),
+            "bytes_per_second": round(float(row.get("bytes_per_second", 0)), 2),
+            "unique_destination_ports": int(row.get("unique_destination_ports", 0)),
+            "syn_count": int(row.get("syn_count", 0)),
+            "syn_ack_ratio": round(float(row.get("syn_ack_ratio", 0)), 4),
+        }
+        alerts.append({
+            "window_id": row["window_id"],
+            "type": label,
+            "severity": severity,
+            "detail": f"Detectat de Random Forest cu confidenta {confidence}%",
+            "timestamp": row["window_start"],
+            "rf_confidence": confidence,
+            "src_ip": row["src_ip"] if "src_ip" in row.index else "unknown",
+            "features_json": json.dumps(features_dict),
+        })
+    return alerts
+
+if __name__ == "__main__":
+    train()
+
+=== ./notifications/__init__.py ===
+
+=== ./notifications/email_sender.py ===
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+def send_critical_alerts(alerts, session_summary=""):
+    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.getenv("SMTP_PORT", 587))
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_pass = os.getenv("SMTP_PASS")
+    recipient = os.getenv("ALERT_EMAIL")
+    if not all([smtp_user, smtp_pass, recipient]):
+        print("Email neconfigurat - skip")
+        return
+
+    critical = [a for a in alerts if a.get("severity") == "CRITICAL"]
+    if not critical:
+        return
+
+
+    subject = "[IDS ALERT] " + str(len(critical)) + " alerte CRITICAL detectate"
+
+    alert_lines = ""
+    for a in critical:
+        alert_lines += "\n  Tip: " + str(a.get("type", ""))
+        alert_lines += "\n  IP Sursa: " + str(a.get("src_ip", "-"))
+        alert_lines += "\n  Detalii: " + str(a.get("detail", ""))
+        ts = a.get("timestamp", "")
+        try:
+            from datetime import datetime
+            ts = datetime.utcfromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S")
+        except:
+            pass
+        alert_lines += "\n  Timestamp: " + str(ts)
+        alert_lines += "\n"
+
+    body = "IDS Dashboard - Alerte de securitate\n\n"
+    body += str(len(critical)) + " alerte CRITICAL detectate:\n"
+    body += alert_lines
+    if session_summary:
+        body += "\nAnaliza AI sesiune:\n" + session_summary + "\n"
+    body += "\n---\nIDS Dashboard"
+
+    msg = MIMEMultipart()
+    msg["From"] = smtp_user
+    msg["To"] = recipient
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+    try:
+        server = smtplib.SMTP(smtp_host, smtp_port)
+        server.starttls()
+        server.login(smtp_user, smtp_pass)
+        server.sendmail(smtp_user, recipient, msg.as_string())
+        server.quit()
+        print("Email trimis: " + str(len(critical)) + " alerte CRITICAL")
+    except Exception as e:
+        print("Eroare email: " + str(e))
+
+=== ./preprocessing/packet_parser.py ===
+
+def parse_flags(flags):
+    if flags is None:
+        return {
+            "SYN": 0, "ACK": 0, "FIN": 0,
+            "RST": 0, "PSH": 0, "URG": 0
+        }
+    return {
+        "SYN": 1 if flags & 0x02 else 0,
+        "ACK": 1 if flags & 0x10 else 0,
+        "FIN": 1 if flags & 0x01 else 0,
+        "RST": 1 if flags & 0x04 else 0,
+        "PSH": 1 if flags & 0x08 else 0,
+        "URG": 1 if flags & 0x20 else 0,
+    }
+
+def enrich_packet(pkt):
+    flags = parse_flags(pkt.get("tcp_flags"))
+    pkt["SYN"] = flags["SYN"]
+    pkt["ACK"] = flags["ACK"]
+    pkt["FIN"] = flags["FIN"]
+    pkt["RST"] = flags["RST"]
+    pkt["PSH"] = flags["PSH"]
+    pkt["URG"] = flags["URG"]
+    return pkt
+
+def parse_packets(packets):
+    return [enrich_packet(pkt) for pkt in packets]
+
+=== ./reports/report_generator.py ===
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+from reportlab.lib.units import cm
+from database import get_all_alerts, get_alerts_count, get_alerts_by_type
+from datetime import datetime
+import io
+import re
+
+def generate_pdf_report():
+    alerts = get_all_alerts(500)
+    total = get_alerts_count()
+    by_type = get_alerts_by_type()
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4),
+        rightMargin=2*cm, leftMargin=2*cm,
+        topMargin=2*cm, bottomMargin=2*cm)
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("title", parent=styles["Title"],
+        fontSize=18, textColor=colors.HexColor("#0f172a"), spaceAfter=6)
+    subtitle_style = ParagraphStyle("subtitle", parent=styles["Normal"],
+        fontSize=10, textColor=colors.HexColor("#64748b"), spaceAfter=20)
+    heading_style = ParagraphStyle("heading", parent=styles["Heading2"],
+        fontSize=12, textColor=colors.HexColor("#0f172a"), spaceBefore=16, spaceAfter=8)
+
+    story = []
+    story.append(Paragraph("IDS Dashboard — Raport", title_style))
+    story.append(Paragraph(f"Generat la: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", subtitle_style))
+
+    story.append(Paragraph("Sumar", heading_style))
+    summary_data = [["Metrica", "Valoare"]]
+    summary_data.append(["Total alerte", str(total)])
+    for t, c in by_type.items():
+        summary_data.append([t, str(c)])
+
+    summary_table = Table(summary_data, colWidths=[10*cm, 6*cm])
+    summary_table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#0f172a")),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.HexColor("#f8fafc"), colors.white]),
+        ("GRID", (0,0), (-1,-1), 0.5, colors.HexColor("#e2e8f0")),
+        ("PADDING", (0,0), (-1,-1), 6),
+    ]))
+    story.append(summary_table)
+
+    if alerts:
+        story.append(Paragraph("Alerte detectate", heading_style))
+
+        table_data = [["ID", "Tip", "Severitate", "IP Sursa", "Confidenta", "Timestamp"]]
+        for alert in alerts:
+            detail = alert.get("detail", "")
+            match = re.search(r"(\d+\.\d+)%", detail)
+            confidenta = match.group(0) if match else "-"
+
+            severity = alert.get("severity", "-")
+            table_data.append([
+                str(alert.get("id", "")),
+                alert.get("type", ""),
+                severity,
+                alert.get("src_ip") or "-",
+                confidenta,
+                str(alert.get("timestamp", ""))[:16],
+            ])
+
+        col_widths = [1.2*cm, 4*cm, 3*cm, 4*cm, 3*cm, 4.5*cm]
+        alerts_table = Table(table_data, colWidths=col_widths)
+
+        cell_styles = [
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#0f172a")),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE", (0,0), (-1,-1), 9),
+            ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.HexColor("#f8fafc"), colors.white]),
+            ("GRID", (0,0), (-1,-1), 0.5, colors.HexColor("#e2e8f0")),
+            ("PADDING", (0,0), (-1,-1), 6),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ]
+
+        for i, alert in enumerate(alerts, 1):
+            severity = alert.get("severity", "")
+            if severity == "CRITICAL":
+                cell_styles.append(("TEXTCOLOR", (2,i), (2,i), colors.HexColor("#ef4444")))
+                cell_styles.append(("FONTNAME", (2,i), (2,i), "Helvetica-Bold"))
+            elif severity == "HIGH":
+                cell_styles.append(("TEXTCOLOR", (2,i), (2,i), colors.HexColor("#f97316")))
+                cell_styles.append(("FONTNAME", (2,i), (2,i), "Helvetica-Bold"))
+            elif severity == "MEDIUM":
+                cell_styles.append(("TEXTCOLOR", (2,i), (2,i), colors.HexColor("#eab308")))
+
+        alerts_table.setStyle(TableStyle(cell_styles))
+        story.append(alerts_table)
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
+def generate_report():
+    alerts = get_all_alerts(500)
+    total = get_alerts_count()
+    by_type = get_alerts_by_type()
+    return {
+        "alerts": alerts,
+        "total_alerts": total,
+        "alerts_by_type": by_type,
+        "generated_at": datetime.now().isoformat(),
+    }
+

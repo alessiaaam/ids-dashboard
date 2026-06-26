@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IDS Dashboard — Activare 2FA</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="auth-page">
+    <div class="auth-container">
+        <div class="auth-box wide">
+            <h1>Activare 2fa</h1>
+            {% with messages = get_flashed_messages() %}
+                {% if messages %}
+                    <div class="alert alert-error">{{ messages[0] }}</div>
+                {% endif %}
+            {% endwith %}
+            <p class="auth-subtitle">Scaneaza codul QR cu Google Authenticator sau Authy, apoi confirma cu un cod generat.</p>
+            <div class="qr-container">
+                <img src="{{ qr }}" alt="QR Code 2FA">
+            </div>
+            <p class="secret-key">Cheie manuala: <code>{{ secret }}</code></p>
+            <form method="POST">
+                <div class="form-group">
+                    <label>Cod de confirmare</label>
+                    <input type="text" name="token" maxlength="6" required autofocus placeholder="000000" autocomplete="one-time-code">
+                </div>
+                <button type="submit" class="btn-primary">Activeaza 2FA</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
